@@ -17,6 +17,7 @@ import org.verapdf.wcag.algorithms.entities.content.ImageChunk;
 import org.verapdf.wcag.algorithms.entities.content.TextLine;
 import org.verapdf.wcag.algorithms.entities.content.TextChunk;
 import org.verapdf.wcag.algorithms.entities.content.TextColumn;
+import org.verapdf.wcag.algorithms.entities.geometry.BoundingBox;
 import org.verapdf.wcag.algorithms.entities.lists.ListItem;
 import org.verapdf.wcag.algorithms.entities.lists.PDFList;
 import org.verapdf.wcag.algorithms.entities.tables.tableBorders.TableBorder;
@@ -32,6 +33,7 @@ public class AutoTaggingProcessor {
     private static final Map<OperatorStreamKey, Map<Integer, Set<StreamInfo>>> operatorIndexesToStreamInfosMap = new HashMap<>();
     private static final Map<OperatorStreamKey, List<COSObject>> structParents = new HashMap<>();
     private static final Map<OperatorStreamKey, Integer> structParentsIntegers = new HashMap<>();
+    private static final Map<Long, SemanticCaption> structElementIdToCaptionMap = new HashMap<>();
     private static boolean isPDF2_0 = false;
     private static final int MAX_TOKENS_PER_STREAM = 100_000;
 
@@ -39,6 +41,7 @@ public class AutoTaggingProcessor {
         operatorIndexesToStreamInfosMap.clear();
         structParents.clear();
         structParentsIntegers.clear();
+        structElementIdToCaptionMap.clear();
         if (document.getVersion() == 2.0F) {
             isPDF2_0 = true;
         }
@@ -138,10 +141,18 @@ public class AutoTaggingProcessor {
     }
 
     private static COSObject addStructElement(COSObject parent, COSDocument cosDocument, String type, Integer pageNumber) {
+        return addStructElement(parent, cosDocument, type, pageNumber, false);
+    }
+
+    private static COSObject addStructElement(COSObject parent, COSDocument cosDocument, String type, Integer pageNumber, boolean isFirstKid) {
         COSObject structElement = COSIndirect.construct(COSDictionary.construct(), cosDocument);
         COSObject k = parent.getKey(ASAtom.K);
         if (k.getType() == COSObjType.COS_ARRAY) {
-            k.add(structElement);
+            if (isFirstKid) {
+                k.insert(0, structElement);
+            } else {
+                k.add(structElement);
+            }
         } else {
             k = COSArray.construct();
             parent.setKey(ASAtom.K, k);
@@ -161,9 +172,7 @@ public class AutoTaggingProcessor {
     public static void createStructureTreeElements(List<List<IObject>> contents, COSObject structTreeRoot, COSDocument cosDocument) {
         COSObject seDocument = addStructElement(structTreeRoot, cosDocument, TaggedPDFConstants.DOCUMENT, null);
         for (List<IObject> pageContents : contents) {
-            for (IObject content : pageContents) {
-                createStructElem(content, seDocument, cosDocument);
-            }
+            addKids(pageContents, seDocument, cosDocument);
         }
     }
 
@@ -172,8 +181,6 @@ public class AutoTaggingProcessor {
             createHeadingStructElem((SemanticHeading) object, parentStructElem, cosDocument);
         } else if (object instanceof SemanticParagraph) {
             createParagraphStructElem((SemanticParagraph) object, parentStructElem, cosDocument);
-        } else if (object instanceof SemanticCaption) {
-            createCaptionStructElem((SemanticCaption) object, parentStructElem, cosDocument);
         } else if (object instanceof PDFList) {
             createListStructElem((PDFList) object, parentStructElem, cosDocument);
         } else if (object instanceof TableBorder) {
@@ -200,8 +207,8 @@ public class AutoTaggingProcessor {
         processTextNode(paragraph, paragraphObject);
     }
 
-    private static void createCaptionStructElem(SemanticCaption caption, COSObject parent, COSDocument cosDocument) {
-        COSObject captionObject = addStructElement(parent, cosDocument, TaggedPDFConstants.CAPTION, caption.getPageNumber());
+    private static void createCaptionStructElem(SemanticCaption caption, COSObject parent, COSDocument cosDocument, boolean isFirstChild) {
+        COSObject captionObject = addStructElement(parent, cosDocument, TaggedPDFConstants.CAPTION, caption.getPageNumber(), isFirstChild);
         processTextNode(caption, captionObject);
     }
 
@@ -210,6 +217,7 @@ public class AutoTaggingProcessor {
         double[] bbox = {image.getLeftX(), image.getBottomY(), image.getRightX(), image.getTopY()};
         addAttributeToStructElem(figureObject, ASAtom.LAYOUT, ASAtom.BBOX, COSArray.construct(4, bbox));
         processImageNode(image, figureObject);
+        addCaptionIfPresent(image, figureObject, cosDocument);
         //TODO: add height and width attributes
     }
 
@@ -245,10 +253,9 @@ public class AutoTaggingProcessor {
                     listItem.getFirstLine().getValue().length()));
             }
             processTextNode(lBodyTextNode, lBodyObject);
-            for (IObject content : listItem.getContents()) {
-                createStructElem(content, lBodyObject, cosDocument);
-            }
+            addKids(listItem.getContents(), lBodyObject, cosDocument);
         }
+        addCaptionIfPresent(list, listObject, cosDocument);
     }
 
     private static void createTableStructElem(TableBorder table, COSObject parent, COSDocument cosDocument) {
@@ -266,20 +273,18 @@ public class AutoTaggingProcessor {
                     if (cell.getRowSpan() != 1) {
                         addAttributeToStructElem(cellObject, ASAtom.TABLE, ASAtom.ROW_SPAN, COSInteger.construct(cell.getRowSpan()));
                     }
-                    for (IObject cellContent : cell.getContents()) {
-                        createStructElem(cellContent, cellObject, cosDocument);
-                    }
+                    addKids(cell.getContents(), cellObject, cosDocument);
                 }
             }
         }
+        addCaptionIfPresent(table, tableObject, cosDocument);
     }
 
     private static void createPartStructElemForTextBlock(TableBorder table, COSObject parent, COSDocument cosDocument) {
         COSObject partObject = addStructElement(parent, cosDocument, TaggedPDFConstants.PART, table.getPageNumber());
         TableBorderCell cell = table.getCell(0,0);
-        for (IObject cellContent : cell.getContents()) {
-            createStructElem(cellContent, partObject, cosDocument);
-        }
+        addKids(cell.getContents(), partObject, cosDocument);
+        addCaptionIfPresent(table, partObject, cosDocument);
     }
 
     private static void addAttributeToStructElem(COSObject structElement, ASAtom ownerASAtom, ASAtom attributeName,
@@ -398,5 +403,34 @@ public class AutoTaggingProcessor {
 
     public static Map<OperatorStreamKey, Map<Integer, Set<StreamInfo>>> getOperatorIndexesToStreamInfosMap() {
         return operatorIndexesToStreamInfosMap;
+    }
+
+    private static void addKids(List<IObject> contents, COSObject parentStructElem, COSDocument cosDocument) {
+        for (IObject content : contents) {
+            if (content instanceof SemanticCaption) {
+                structElementIdToCaptionMap.put(((SemanticCaption) content).getLinkedContentId(), (SemanticCaption) content);
+            }
+        }
+        for (IObject content : contents) {
+            createStructElem(content, parentStructElem, cosDocument);
+        }
+    }
+
+    private static void addCaptionIfPresent(IObject content, COSObject linkedObject, COSDocument cosDocument) {
+        Long linkedContentId = content.getRecognizedStructureId();
+        if (structElementIdToCaptionMap.containsKey(linkedContentId)) {
+            SemanticCaption caption = structElementIdToCaptionMap.get(linkedContentId);
+            createCaptionStructElem(caption, linkedObject, cosDocument, isCaptionFirstChild(caption.getBoundingBox(), content.getBoundingBox()));
+        }
+    }
+
+    public static boolean isCaptionFirstChild(BoundingBox caption, BoundingBox parent) {
+        if (caption.getCenterY() > parent.getTopY()) {
+            return true;
+        } else if (caption.getCenterY() < parent.getBottomY()) {
+            return false;
+        } else {
+            return caption.getCenterX() < parent.getCenterX();
+        }
     }
 }
